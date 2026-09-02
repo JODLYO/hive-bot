@@ -8,6 +8,10 @@ dependencies = [
     "torch>=2.2",
     "numpy>=1.26",
     "tqdm>=4.66",
+    # tqdm.auto needs this to render as a real notebook widget (Colab,
+    # Jupyter, VS Code) instead of silently falling back to a plain-text
+    # bar that doesn't always render cleanly in a notebook cell's output.
+    "ipywidgets>=8.0",
 ]
 
 [project.optional-dependencies]
