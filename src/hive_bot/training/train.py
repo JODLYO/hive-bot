@@ -12,6 +12,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from tqdm.auto import tqdm, trange
 
 from ..engine.constants import BASE_PIECE_TYPES, PieceType
 from ..model.network import HiveNet, score_actions
@@ -74,10 +75,12 @@ def train(
     rng = random.Random(seed)
     np_rng = np.random.default_rng(seed)
 
-    for offset in range(iterations):
+    for offset in trange(iterations, desc="training run"):
         iteration = start_iteration + offset
         model.eval()
-        for _ in range(games_per_iter):
+        for _ in tqdm(
+            range(games_per_iter), desc=f"iter {iteration}: self-play", leave=False
+        ):
             samples = play_game(
                 model,
                 simulations,
@@ -85,12 +88,15 @@ def train(
                 rng=rng,
                 np_rng=np_rng,
                 max_plies=max_plies,
+                show_progress=True,
             )
             buffer.add_game(samples)
 
         model.train()
         last_losses = (float("nan"), float("nan"), float("nan"))
-        for _ in range(batches_per_iter):
+        for _ in tqdm(
+            range(batches_per_iter), desc=f"iter {iteration}: training", leave=False
+        ):
             if len(buffer) < batch_size:
                 break
             batch = buffer.sample(batch_size, rng)
@@ -100,7 +106,7 @@ def train(
             optimizer.step()
             last_losses = (total_loss.item(), policy_loss.item(), value_loss.item())
 
-        print(
+        tqdm.write(
             f"iteration {iteration}: buffer={len(buffer)} "
             f"loss={last_losses[0]:.4f} policy={last_losses[1]:.4f} value={last_losses[2]:.4f}"
         )

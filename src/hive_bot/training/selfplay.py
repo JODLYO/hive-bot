@@ -18,6 +18,7 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
+from tqdm.auto import tqdm
 
 from ..engine.actions import ActionKey, move_to_action_key
 from ..engine.apply import apply_move
@@ -55,6 +56,7 @@ def play_game(
     max_plies: int = DEFAULT_MAX_PLIES,
     rng: random.Random | None = None,
     np_rng: np.random.Generator | None = None,
+    show_progress: bool = False,
 ) -> list[Sample]:
     rng = rng if rng is not None else random.Random()
     np_rng = np_rng if np_rng is not None else np.random.default_rng()
@@ -65,7 +67,8 @@ def play_game(
     pending: list[
         tuple[torch.Tensor, torch.Tensor, list[ActionKey], torch.Tensor, int]
     ] = []
-    for ply in range(max_plies):
+    ply_bar = tqdm(range(max_plies), desc="plies", leave=False, disable=not show_progress)
+    for ply in ply_bar:
         if state.game_over:
             break
         root = mcts.run(state, num_simulations=num_simulations, add_root_noise=True)
@@ -88,6 +91,8 @@ def play_game(
         temperature = 1.0 if ply < temperature_plies else 0.0
         move = select_move(root, temperature, rng=rng)
         apply_move(state, move)
+        ply_bar.set_postfix(turn=state.turn_no)
+    ply_bar.close()
 
     outcome = state.winner  # None if max_plies was hit without a result
 
@@ -135,9 +140,14 @@ def _main() -> None:
     rng = random.Random(args.seed)
     np_rng = np.random.default_rng(args.seed)
 
-    for i in range(args.games):
+    for i in tqdm(range(args.games), desc="games"):
         samples = play_game(
-            model, args.simulations, rng=rng, np_rng=np_rng, max_plies=args.max_plies
+            model,
+            args.simulations,
+            rng=rng,
+            np_rng=np_rng,
+            max_plies=args.max_plies,
+            show_progress=True,
         )
         outcome = samples[-1].value_target if samples else float("nan")
         print(f"game {i}: {len(samples)} plies, final-mover value_target={outcome:+.0f}")
