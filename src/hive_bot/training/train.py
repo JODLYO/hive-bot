@@ -81,6 +81,7 @@ def train(
         for _ in tqdm(
             range(games_per_iter), desc=f"iter {iteration}: self-play", leave=False
         ):
+            print(f"in game {_}")
             samples = play_game(
                 model,
                 simulations,
