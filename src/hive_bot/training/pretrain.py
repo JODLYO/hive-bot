@@ -15,8 +15,12 @@ the order of hundreds of GB. `_iter_sample_batches` instead shuffles the
 the resulting samples within that chunk for batch diversity), yields
 batches, and discards the chunk before moving to the next one -- so peak
 memory is bounded by chunk size, not dataset size, at the cost of
-re-running engine replay each epoch (cheap; it's pure-Python move
-generation, not the tensor encoding that dominates memory).
+re-running engine replay every epoch. That replay is pure-Python engine
+move generation (not the GPU-bound part of training at all), so it's the
+main thing worth parallelizing: `workers > 1` replays a chunk's games
+across a process pool, same pattern as
+scripts/build_pretrain_dataset.py's validation pass, cutting the
+CPU-bound wall-clock cost roughly by the worker count.
 
 The whole point of this module is the checkpoint it produces: saved in the
 exact `{"model": ..., "optimizer": ..., "iteration": 0}` shape `train()`'s
@@ -29,8 +33,10 @@ so `train(resume_from=...)` naturally starts self-play at iteration 1.
 from __future__ import annotations
 
 import argparse
+import os
 import random
 from collections.abc import Iterator
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -51,31 +57,60 @@ from .train import compute_loss
 DEFAULT_GAMES_PER_CHUNK = 200  # ~200 games * ~38 plies/game ~= 1.6GB of encoded samples
 
 
+def _replay_game_samples(
+    game: dict[str, Any], enabled_types: frozenset[PieceType]
+) -> list[Sample]:
+    """Module-level (so it's picklable for a process pool) single-game
+    replay -- returns [] for a game that doesn't replay cleanly rather
+    than raising, since games passed in should already have been
+    validated by build_pretrain_dataset.py; this is just defensive."""
+    history = [tuple(m) for m in game["history"]]
+    winner = winner_from_game_status(game.get("game_status"))
+    try:
+        return replay_uhp_game(history, winner, enabled_types).samples
+    except UhpReplayError:
+        return []
+
+
 def _iter_sample_batches(
     games: list[dict[str, Any]],
     enabled_types: frozenset[PieceType],
     batch_size: int,
     games_per_chunk: int,
     rng: random.Random,
+    workers: int = 1,
 ) -> Iterator[list[Sample]]:
+    """Replaying/encoding a chunk is pure-Python engine work -- CPU-bound,
+    not GPU-bound -- so `workers > 1` spreads a chunk's games across a
+    process pool instead of replaying them one at a time on the caller's
+    process. This doesn't change *which* samples end up in which batch
+    (same chunk membership, same post-chunk shuffle), only how fast the
+    chunk gets produced."""
     shuffled = list(games)
     rng.shuffle(shuffled)
-    for chunk_start in range(0, len(shuffled), games_per_chunk):
-        chunk_samples: list[Sample] = []
-        for game in shuffled[chunk_start : chunk_start + games_per_chunk]:
-            history = [tuple(m) for m in game["history"]]
-            winner = winner_from_game_status(game.get("game_status"))
-            try:
-                result = replay_uhp_game(history, winner, enabled_types)
-            except UhpReplayError:
-                # Already filtered by build_pretrain_dataset.py -- this is
-                # just defensive, in case games are ever passed in without
-                # going through that validation step first.
-                continue
-            chunk_samples.extend(result.samples)
-        rng.shuffle(chunk_samples)
-        for start in range(0, len(chunk_samples), batch_size):
-            yield chunk_samples[start : start + batch_size]
+
+    pool = ProcessPoolExecutor(max_workers=workers) if workers > 1 else None
+    try:
+        for chunk_start in range(0, len(shuffled), games_per_chunk):
+            chunk_games = shuffled[chunk_start : chunk_start + games_per_chunk]
+            chunk_samples: list[Sample] = []
+            if pool is not None:
+                for samples in pool.map(
+                    _replay_game_samples,
+                    chunk_games,
+                    (enabled_types for _ in chunk_games),
+                    chunksize=max(1, len(chunk_games) // (workers * 4)),
+                ):
+                    chunk_samples.extend(samples)
+            else:
+                for game in chunk_games:
+                    chunk_samples.extend(_replay_game_samples(game, enabled_types))
+            rng.shuffle(chunk_samples)
+            for start in range(0, len(chunk_samples), batch_size):
+                yield chunk_samples[start : start + batch_size]
+    finally:
+        if pool is not None:
+            pool.shutdown()
 
 
 def _mean_val_loss(
@@ -84,6 +119,7 @@ def _mean_val_loss(
     enabled_types: frozenset[PieceType],
     batch_size: int,
     games_per_chunk: int,
+    workers: int,
 ) -> float:
     """No shuffling matters here, no grad, no optimizer step -- this never
     influences the weights, it only measures how the current weights
@@ -98,12 +134,18 @@ def _mean_val_loss(
     # which games get evaluated or the resulting mean.
     with torch.no_grad():
         for batch in _iter_sample_batches(
-            val_games, enabled_types, batch_size, games_per_chunk, random.Random(0)
+            val_games, enabled_types, batch_size, games_per_chunk, random.Random(0), workers
         ):
             total_loss, _, _ = compute_loss(model, batch)
             loss_total += total_loss.item()
             num_batches += 1
     return loss_total / max(num_batches, 1)
+
+
+# Half the machine's cores by default rather than all of them -- leaves
+# headroom for whatever else is running (e.g. the notebook kernel itself,
+# or other work sharing the machine) instead of adding to contention.
+DEFAULT_WORKERS = max(1, (os.cpu_count() or 2) // 2)
 
 
 def pretrain(
@@ -114,6 +156,7 @@ def pretrain(
     enabled_types: frozenset[PieceType] = BASE_PIECE_TYPES,
     batch_size: int = 32,
     games_per_chunk: int = DEFAULT_GAMES_PER_CHUNK,
+    workers: int = DEFAULT_WORKERS,
     lr: float = 1e-3,
     val_games: list[dict[str, Any]] | None = None,
     checkpoint_dir: Path | None = None,
@@ -137,7 +180,7 @@ def pretrain(
         loss_total = 0.0
 
         batches = _iter_sample_batches(
-            games, enabled_types, batch_size, games_per_chunk, rng
+            games, enabled_types, batch_size, games_per_chunk, rng, workers
         )
         for batch in tqdm(batches, desc=f"epoch {epoch}", leave=False):
             total_loss, policy_loss, value_loss = compute_loss(model, batch)
@@ -151,7 +194,7 @@ def pretrain(
         val_msg = ""
         if val_games:
             val_loss = _mean_val_loss(
-                model, val_games, enabled_types, batch_size, games_per_chunk
+                model, val_games, enabled_types, batch_size, games_per_chunk, workers
             )
             val_msg = f" val_loss={val_loss:.4f}"
 
@@ -194,6 +237,12 @@ def _main() -> None:
         default=DEFAULT_GAMES_PER_CHUNK,
         help="How many games' worth of samples to hold in memory at once.",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=DEFAULT_WORKERS,
+        help="Worker processes replaying/encoding games (they're independent, so this parallelizes cleanly).",
+    )
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--checkpoint-dir", type=str, default=None)
@@ -220,6 +269,7 @@ def _main() -> None:
         epochs=args.epochs,
         batch_size=args.batch_size,
         games_per_chunk=args.games_per_chunk,
+        workers=args.workers,
         lr=args.lr,
         val_games=val_games,
         seed=args.seed,
