@@ -20,16 +20,36 @@ dependencies = [
 reference = [
     "pydantic>=2",
 ]
+# onnx: only needed by export/onnx_export.py's post-export verification
+# step. onnxscript: torch's default (dynamo-based) ONNX exporter requires
+# it as of torch 2.13, even without explicitly requesting dynamo=True.
+export = [
+    "onnx>=1.15",
+    "onnxscript>=0.1",
+]
+# Only needed by scripts/scrape_hivegame_archive.py -- see the plan doc
+# ("Bootstrap training from real hivegame.com games"). playwright drives a
+# real browser against the live site (its archive search is a Leptos
+# server function, not a documented REST API); cbor2 decodes the
+# intercepted responses (application/cbor).
+scrape = [
+    "playwright>=1.45",
+    "cbor2>=5.6",
+]
 
 [dependency-groups]
 dev = [
     "hive-bot[reference]",
+    "hive-bot[export]",
     "pytest>=8",
     "hypothesis>=6.100",
     "ruff>=0.6",
     "mypy>=1.11",
     "ipykernel>=6.29",
     "types-tqdm>=4.66",
+    # For test_onnx_export.py's numeric-parity check against PyTorch's own
+    # forward() -- not needed at runtime by anything shipped.
+    "onnxruntime>=1.17",
 ]
 
 [build-system]

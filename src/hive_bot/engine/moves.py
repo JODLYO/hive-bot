@@ -191,14 +191,24 @@ def _slide_reachable(
 ) -> set[Pos]:
     """All destinations reachable from `start` by sliding across `occupied`
     (which must NOT include `start` itself -- the piece is lifted first).
-    A single BFS pass computes every reachable destination instead of
-    validating one candidate at a time: since the wedge/gate check and the
-    "hive stays connected" check at each step only depend on the current
-    node and the single candidate next node (not on the path taken to get
-    there), a node's onward reachability is independent of which shortest
-    path first discovered it, so a single shared `visited` set across the
-    whole search is exact, not an approximation.
+    Exact-step sliding (spider) needs a different search than
+    unbounded/max-step sliding (ant/queen) -- see `_slide_reachable_exact`
+    for why -- so this just dispatches to whichever is correct.
     """
+    if exact_steps is not None:
+        return _slide_reachable_exact(occupied, start, exact_steps)
+
+    # A single BFS pass computes every reachable destination instead of
+    # validating one candidate at a time: since the wedge/gate check and
+    # the "hive stays connected" check at each step only depend on the
+    # current node and the single candidate next node (not on the path
+    # taken to get there), and *any* non-self-crossing path to a node
+    # within max_steps is equally good enough (there's no "must be exactly
+    # this many steps" requirement here), a node's reachability doesn't
+    # depend on which path first discovered it -- so a single shared
+    # `visited` set across the whole search is exact, not an
+    # approximation. (This reasoning does NOT extend to exact-step
+    # sliding -- see `_slide_reachable_exact`.)
     visited = {start}
     reachable: set[Pos] = set()
     queue: deque[tuple[Pos, int]] = deque([(start, 0)])
@@ -217,17 +227,59 @@ def _slide_reachable(
                 continue  # wedged: both flanking hexes occupied
 
             new_steps = steps + 1
-            if exact_steps is not None:
-                if new_steps == exact_steps:
-                    reachable.add(nb)
-            elif max_steps is None or new_steps <= max_steps:
+            if max_steps is None or new_steps <= max_steps:
                 reachable.add(nb)
-
-            can_extend = (max_steps is None or new_steps < max_steps) and (
-                exact_steps is None or new_steps < exact_steps
-            )
-            if can_extend:
+            if max_steps is None or new_steps < max_steps:
                 queue.append((nb, new_steps))
+    return reachable
+
+
+def _slide_reachable_exact(
+    occupied: frozenset[Pos], start: Pos, exact_steps: int
+) -> set[Pos]:
+    """Destinations reachable from `start` in *exactly* `exact_steps`
+    slides (spider), without ever crossing a hex already visited earlier
+    in that same slide.
+
+    Unlike max-step sliding, this can't reuse one shared `visited` set
+    across the whole search: a hex first reached via a *shorter* path
+    would then block rediscovering it via a *different*, longer,
+    non-self-crossing path that legitimately reaches it in exactly
+    `exact_steps` -- "no revisiting a hex" is a per-path rule, not a
+    global one across every path from `start`. A real game found this
+    concretely: a destination the shared-visited BFS marked unreachable
+    (some other path had already visited it after 2 steps) but which a
+    valid 3-step path -- through different intermediate hexes -- does
+    reach. So this instead explores every non-self-crossing path
+    explicitly; cheap in practice since `exact_steps` is always 3 (only
+    spider uses this) with branching factor at most 6.
+
+    This exact bug is present in the vendored reference's own
+    `can_slide_path` (tests/reference/helpers.py -- an unmodified copy of
+    the real ttbg-web-app's own code, not just this repo's re-transcribed
+    oracle), so it isn't just a bug here -- it's a real, reachable bug in
+    the shipped Django app itself. test_engine_vs_reference.py's oracle
+    comparison inherits it via `tests/reference/oracle.py`, which calls
+    the same `can_slide_path` -- see that test file for how spider moves
+    are carved out of the direct oracle comparison as a result.
+    """
+    reachable: set[Pos] = set()
+
+    def dfs(current: Pos, path: frozenset[Pos], steps: int) -> None:
+        if steps == exact_steps:
+            reachable.add(current)
+            return
+        for nb in neighbors(current):
+            if nb in path or nb in occupied:
+                continue
+            if not positions_connected(occupied | {nb}):
+                continue
+            n1, n2 = shared_neighbors(current, nb)
+            if n1 in occupied and n2 in occupied:
+                continue  # wedged: both flanking hexes occupied
+            dfs(nb, path | {nb}, steps + 1)
+
+    dfs(start, frozenset({start}), 0)
     return reachable
 
 

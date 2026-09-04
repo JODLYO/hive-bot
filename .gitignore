@@ -6,5 +6,10 @@ __pycache__/
 .ruff_cache/
 checkpoints/
 *.ipynb_checkpoints/
+# Scraped hivegame.com games + parsed pretrain samples -- bulk external
+# data, not something to commit (anchored to repo root so it doesn't also
+# match src/hive_bot/data/, the UHP-replay package). See
+# scripts/scrape_hivegame_archive.py.
+/data/
 .DS_Store
 uv.lock.bak

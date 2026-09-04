@@ -1,0 +1,24 @@
+{
+  "name": "hive-bot-web",
+  "version": "0.1.0",
+  "description": "In-browser Hive bot: engine + PUCT MCTS + ONNX Runtime Web inference. TypeScript port of the Python hive-bot package's engine/model/analysis layers, kept behaviorally identical via fixtures generated from it (see test/fixtures/).",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "typecheck": "tsc --noEmit -p tsconfig.test.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "onnxruntime-web": "^1.19.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0",
+    "vitest": "^4.0.0"
+  }
+}

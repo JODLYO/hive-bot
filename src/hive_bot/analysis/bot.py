@@ -11,12 +11,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import torch
-
 from ..engine.moves import Move
 from ..engine.state import GameState
 from ..model.mcts import MCTS, Node, visit_counts
-from ..model.network import HiveNet
+from ..model.network import HiveNet, load_hivenet_from_checkpoint
 
 
 @dataclass(slots=True)
@@ -70,18 +68,7 @@ class HiveBot:
     def from_checkpoint(
         cls, path: Path, num_simulations: int = 400, **network_kwargs: Any
     ) -> HiveBot:
-        """`network_kwargs` must match whatever HiveNet(...) sizing the
-        checkpoint was trained with (trunk_channels, num_blocks, ...) --
-        the checkpoint only stores weights, not the architecture."""
-        checkpoint = torch.load(path, map_location="cpu")
-        state_dict = (
-            checkpoint["model"]
-            if isinstance(checkpoint, dict) and "model" in checkpoint
-            else checkpoint
-        )
-        model = HiveNet(**network_kwargs)
-        model.load_state_dict(state_dict)
-        model.eval()
+        model = load_hivenet_from_checkpoint(path, **network_kwargs)
         return cls(model, num_simulations=num_simulations)
 
     def analyze(self, state: GameState) -> PositionAnalysis:

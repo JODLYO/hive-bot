@@ -19,7 +19,8 @@ get distinct scores.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import NamedTuple
+from pathlib import Path
+from typing import Any, NamedTuple
 
 import torch
 from torch import nn
@@ -120,6 +121,26 @@ class HiveNet(nn.Module):
             kind_bias=self.kind_bias.weight,
             value=value,
         )
+
+
+def load_hivenet_from_checkpoint(path: Path, **network_kwargs: Any) -> HiveNet:
+    """Load weights saved either as `train.py`'s checkpoint dict
+    (`{"model": state_dict, "optimizer": ..., "iteration": ...}`) or a bare
+    `model.state_dict()`. `network_kwargs` must match whatever `HiveNet(...)`
+    sizing the checkpoint was trained with (trunk_channels, num_blocks,
+    ...) -- the checkpoint only stores weights, not the architecture.
+    Returns the model in eval mode (so BatchNorm uses its running stats,
+    not batch stats -- required for correct single-sample inference)."""
+    checkpoint = torch.load(path, map_location="cpu")
+    state_dict = (
+        checkpoint["model"]
+        if isinstance(checkpoint, dict) and "model" in checkpoint
+        else checkpoint
+    )
+    model = HiveNet(**network_kwargs)
+    model.load_state_dict(state_dict)
+    model.eval()
+    return model
 
 
 def score_actions(

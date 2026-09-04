@@ -145,11 +145,18 @@ class GameState:
         return self.board[pos].index(piece_id)
 
     def board_positions(self, owner: int) -> set[Pos]:
+        """Positions where `owner` currently has the top piece of the
+        stack. Deliberately *not* "every position any piece of theirs has
+        ever occupied" -- a piece buried under an opponent's beetle/
+        mosquito no longer controls that hex for placement-adjacency
+        purposes (the "don't place touching an opponent" rule), only
+        whichever piece is currently on top does. Confirmed against the
+        oracle: using `pieces_on_board` here (any piece, buried or not)
+        wrongly forbids/allows placements near a mixed-color stack."""
         positions: set[Pos] = set()
-        for pid in self.pieces_on_board(owner):
-            pos = self.position[pid]
-            assert pos is not None
-            positions.add(pos)
+        for pos, stack in self.board.items():
+            if self.pieces[stack[-1]].owner == owner:
+                positions.add(pos)
         return positions
 
     def pieces_on_board(self, owner: int) -> list[int]:
