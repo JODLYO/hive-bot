@@ -16,7 +16,12 @@ from hive_bot.engine.encode import encode_state
 from hive_bot.engine.moves import generate_legal_moves
 from hive_bot.engine.state import GameState
 from hive_bot.model.mcts import MCTS, select_move, visit_counts
-from hive_bot.model.network import HiveNet, score_actions
+from hive_bot.model.network import (
+    HiveNet,
+    score_actions,
+    score_actions_batch,
+    segmented_log_softmax,
+)
 
 TINY_NET_KWARGS = {"trunk_channels": 8, "num_blocks": 1, "embed_dim": 4, "global_hidden": 8}
 
@@ -57,6 +62,61 @@ def test_score_actions_matches_move_count() -> None:
         scores = score_actions(output, keys)
     assert scores.shape == (len(moves),)
     assert torch.isfinite(scores).all()
+
+
+def test_score_actions_batch_matches_per_sample_score_actions() -> None:
+    """`compute_loss` uses `score_actions_batch` purely for speed (one
+    batched gather instead of a Python loop of small per-sample ones) --
+    it must produce byte-identical scores to calling `score_actions` once
+    per sample, or training math silently changes. Uses states with
+    different numbers of legal actions (varying board positions), since
+    that's exactly the ragged-batch case the batched version has to
+    handle correctly."""
+    model = _tiny_model()
+    states = []
+    state = GameState.new_game(BASE_PIECE_TYPES)
+    states.append(state)
+    rng = random.Random(0)
+    for _ in range(3):
+        moves = generate_legal_moves(state)
+        apply_move(state, rng.choice(moves))
+        states.append(state)
+
+    keys_per_sample = []
+    boards = []
+    global_features = []
+    for s in states:
+        moves = generate_legal_moves(s)
+        keys_per_sample.append(legal_action_keys(s, moves))
+        encoded = encode_state(s)
+        boards.append(encoded.board)
+        global_features.append(encoded.global_features)
+
+    with torch.no_grad():
+        output = model(torch.stack(boards), torch.stack(global_features))
+
+        expected = torch.cat(
+            [
+                score_actions(output, keys, batch_index=i)
+                for i, keys in enumerate(keys_per_sample)
+            ]
+        )
+        actual, sample_idx = score_actions_batch(output, keys_per_sample)
+
+    assert torch.allclose(actual, expected, atol=1e-6)
+    expected_sample_idx = [i for i, keys in enumerate(keys_per_sample) for _ in keys]
+    assert sample_idx.tolist() == expected_sample_idx
+
+
+def test_segmented_log_softmax_matches_per_group_log_softmax() -> None:
+    scores = torch.tensor([1.0, 2.0, 3.0, 0.5, -1.0])
+    sample_idx = torch.tensor([0, 0, 0, 1, 1])
+    actual = segmented_log_softmax(scores, sample_idx, num_samples=2)
+
+    expected_0 = torch.log_softmax(scores[:3], dim=0)
+    expected_1 = torch.log_softmax(scores[3:], dim=0)
+    expected = torch.cat([expected_0, expected_1])
+    assert torch.allclose(actual, expected, atol=1e-6)
 
 
 def test_mcts_run_produces_visit_distribution_over_root_children() -> None:

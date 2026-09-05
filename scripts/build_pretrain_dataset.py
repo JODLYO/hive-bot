@@ -13,6 +13,11 @@ games at a time each epoch, encoding samples on the fly and discarding
 them once trained on -- so this script's only job is to produce small
 (history + result only, no tensors) JSONL files for it to stream from.
 
+Games abandoned after only a handful of plies (`--min-plies`, default 6)
+are dropped up front, before validation -- they're not wrong data, just
+not useful supervision (a no-show or instant resignation teaches the
+network nothing about how to actually play).
+
 Validation is pure-Python engine replay (no I/O, no shared state) per
 game, so it's split across a process pool -- at real archive scale
 (tens of thousands of games) a single process showed zero progress output
@@ -117,8 +122,18 @@ def build_dataset(
     val_fraction: float,
     seed: int,
     workers: int,
+    min_plies: int,
 ) -> None:
-    games = load_base_games_jsonl(games_path)
+    all_games = load_base_games_jsonl(games_path)
+
+    # A game abandoned after only a few plies (a no-show, an instant
+    # resignation, someone backing out of a mis-click) isn't a real
+    # played game -- it's not wrong data exactly, but it's not useful
+    # supervision either, so it's dropped before validation rather than
+    # counted as a "failure" (it replays just fine, there's just nothing
+    # to learn from a handful of opening placements and nothing else).
+    games = [g for g in all_games if len(g["history"]) >= min_plies]
+    num_too_short = len(all_games) - len(games)
 
     # Split by game, before validating -- see the module docstring for why.
     random.Random(seed).shuffle(games)
@@ -130,6 +145,10 @@ def build_dataset(
     valid_train = _validate_games(train_games, failure_reasons, workers, "validating train")
     valid_val = _validate_games(val_games, failure_reasons, workers, "validating val")
 
+    print(
+        f"dropped {num_too_short}/{len(all_games)} games with fewer than "
+        f"{min_plies} plies (abandoned/no-show games)"
+    )
     print(
         f"validated {len(valid_train) + len(valid_val)}/{len(games)} games "
         f"(train: {len(valid_train)}/{len(train_games)}; "
@@ -169,6 +188,12 @@ def main() -> None:
         "--seed", type=int, default=0, help="Shuffle seed for the train/val game split."
     )
     parser.add_argument(
+        "--min-plies",
+        type=int,
+        default=6,
+        help="Drop games with fewer than this many recorded plies (abandoned/no-show games).",
+    )
+    parser.add_argument(
         "--workers",
         type=int,
         # Half the machine's cores by default rather than all of them --
@@ -179,7 +204,13 @@ def main() -> None:
     )
     args = parser.parse_args()
     build_dataset(
-        args.games, args.train_out, args.val_out, args.val_fraction, args.seed, args.workers
+        args.games,
+        args.train_out,
+        args.val_out,
+        args.val_fraction,
+        args.seed,
+        args.workers,
+        args.min_plies,
     )
 
 

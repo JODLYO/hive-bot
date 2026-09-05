@@ -160,18 +160,32 @@ def pretrain(
     lr: float = 1e-3,
     val_games: list[dict[str, Any]] | None = None,
     checkpoint_dir: Path | None = None,
+    checkpoint_every_batches: int | None = None,
     seed: int | None = None,
+    device: str | torch.device | None = None,
 ) -> HiveNet:
     """`games`/`val_games` are raw scraped-game dicts (each needs a
     `history` field and a `game_status` field) -- typically loaded via
     `data.hivegame_archive.load_base_games_jsonl` from the JSONL files
     scripts/build_pretrain_dataset.py produces, which have already been
-    validated to replay cleanly against `enabled_types`."""
+    validated to replay cleanly against `enabled_types`.
+
+    `device` defaults to CUDA if available -- nothing else in this
+    codebase moves the model there automatically, so without this (or the
+    caller doing it themselves) training silently runs on CPU even with a
+    GPU attached, which is most of why a "30s/batch"-scale run turns out
+    to be CPU-bound: a real-sized ResNet-ish net at BOARD_DIM=55 resolution
+    is not fast on CPU alone."""
     if not games:
         raise ValueError("pretrain() needs at least one game")
 
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = model.to(device)
+
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     rng = random.Random(seed)
+    global_batch = 0
 
     for epoch in trange(epochs, desc="pretrain"):
         model.train()
@@ -190,6 +204,16 @@ def pretrain(
             last_losses = (total_loss.item(), policy_loss.item(), value_loss.item())
             loss_total += last_losses[0]
             num_batches += 1
+            global_batch += 1
+
+            if (
+                checkpoint_dir is not None
+                and checkpoint_every_batches is not None
+                and global_batch % checkpoint_every_batches == 0
+            ):
+                _save_checkpoint(
+                    model, optimizer, checkpoint_dir / f"pretrain_batch_{global_batch}.pt"
+                )
 
         val_msg = ""
         if val_games:
@@ -205,17 +229,23 @@ def pretrain(
         )
 
         if checkpoint_dir is not None:
-            checkpoint_dir.mkdir(parents=True, exist_ok=True)
-            torch.save(
-                {
-                    "model": model.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "iteration": 0,
-                },
-                checkpoint_dir / f"pretrain_epoch_{epoch}.pt",
+            _save_checkpoint(
+                model, optimizer, checkpoint_dir / f"pretrain_epoch_{epoch}.pt"
             )
 
     return model
+
+
+def _save_checkpoint(model: HiveNet, optimizer: torch.optim.Optimizer, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "iteration": 0,
+        },
+        path,
+    )
 
 
 def _main() -> None:
@@ -247,6 +277,12 @@ def _main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--checkpoint-dir", type=str, default=None)
     parser.add_argument(
+        "--checkpoint-every-batches",
+        type=int,
+        default=None,
+        help="Also save mid-epoch every N batches (in addition to once per epoch).",
+    )
+    parser.add_argument(
         "--tiny-net",
         action="store_true",
         help="Use a small network (fast on CPU) instead of the real training size.",
@@ -274,6 +310,7 @@ def _main() -> None:
         val_games=val_games,
         seed=args.seed,
         checkpoint_dir=Path(args.checkpoint_dir) if args.checkpoint_dir else None,
+        checkpoint_every_batches=args.checkpoint_every_batches,
     )
 
 

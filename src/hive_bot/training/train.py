@@ -15,7 +15,7 @@ import torch
 from tqdm.auto import tqdm, trange
 
 from ..engine.constants import BASE_PIECE_TYPES, PieceType
-from ..model.network import HiveNet, score_actions
+from ..model.network import HiveNet, score_actions_batch, segmented_log_softmax
 from .replay_buffer import ReplayBuffer
 from .selfplay import DEFAULT_MAX_PLIES, Sample, play_game
 
@@ -23,19 +23,35 @@ from .selfplay import DEFAULT_MAX_PLIES, Sample, play_game
 def compute_loss(
     model: HiveNet, batch: list[Sample]
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    boards = torch.stack([s.board for s in batch])
-    global_features = torch.stack([s.global_features for s in batch])
+    # Runs on whatever device `model`'s parameters are already on -- the
+    # caller (train()/pretrain()) is responsible for having moved the
+    # model there; this just follows it rather than silently training on
+    # CPU even when a GPU is available (which nothing else in this file
+    # was accounting for before).
+    device = next(model.parameters()).device
+    boards = torch.stack([s.board for s in batch]).to(device)
+    global_features = torch.stack([s.global_features for s in batch]).to(device)
     output = model(boards, global_features)
 
-    value_targets = torch.tensor([s.value_target for s in batch], dtype=torch.float32)
+    value_targets = torch.tensor(
+        [s.value_target for s in batch], dtype=torch.float32, device=device
+    )
     value_loss = torch.nn.functional.mse_loss(output.value, value_targets)
 
-    policy_losses = []
-    for i, sample in enumerate(batch):
-        scores = score_actions(output, sample.action_keys, batch_index=i)
-        log_probs = torch.log_softmax(scores, dim=0)
-        policy_losses.append(-(sample.target_policy * log_probs).sum())
-    policy_loss = torch.stack(policy_losses).mean()
+    # Vectorized across the whole batch (one gather + one segmented
+    # softmax) rather than a Python loop calling score_actions once per
+    # sample -- each sample has a different number of legal actions, so
+    # this can't be a single dense softmax, but it doesn't need hundreds
+    # of separate small GPU ops either. See score_actions_batch's
+    # docstring for the full reasoning.
+    keys_per_sample = [s.action_keys for s in batch]
+    scores, sample_idx = score_actions_batch(output, keys_per_sample)
+    log_probs = segmented_log_softmax(scores, sample_idx, len(batch))
+    target_policy_flat = torch.cat([s.target_policy.to(device) for s in batch])
+    weighted = target_policy_flat * log_probs
+    per_sample_loss = torch.zeros(len(batch), device=device, dtype=weighted.dtype)
+    per_sample_loss = per_sample_loss.scatter_add(0, sample_idx, weighted)
+    policy_loss = -per_sample_loss.mean()
 
     return policy_loss + value_loss, policy_loss, value_loss
 

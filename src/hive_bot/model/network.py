@@ -173,3 +173,99 @@ def score_actions(
         from_vecs[is_place] = place_from_vecs
 
     return (from_vecs * to_vecs).sum(dim=1)
+
+
+def score_actions_batch(
+    output: NetworkOutput, keys_per_sample: Sequence[Sequence[ActionKey]]
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Batched equivalent of calling `score_actions(output, keys,
+    batch_index=i)` once per sample and concatenating the results --
+    training's loss (train.py's `compute_loss`) needs every sample's
+    scores, and doing that as a Python loop over samples means one small
+    GPU gather per sample (a handful of ops each), which is dominated by
+    per-launch overhead rather than actual compute: hundreds of tiny
+    kernel launches per batch instead of a handful of batched ones. This
+    flattens every sample's action keys into one set of index tensors
+    (tagged with which sample each entry came from) so the whole batch's
+    scores come from a single gather, matching `score_actions`'
+    per-action arithmetic exactly.
+
+    Building the flat Python lists below is still a per-action Python
+    loop, but it's pure list/int-append work -- no tensor creation or GPU
+    calls happen until all of them are built, unlike the naive per-sample
+    version.
+
+    Returns `(scores, sample_index)`: flattened scores for every action
+    across every sample, and a same-length tensor saying which sample
+    (0..B-1) each score belongs to -- the caller needs that to do a
+    per-sample (not batch-wide) softmax over each sample's own legal
+    actions, since action-set size varies per sample.
+    """
+    device = output.value.device
+    kinds: list[int] = []
+    from_idx: list[int] = []
+    to_idx: list[int] = []
+    sample_idx: list[int] = []
+    for i, keys in enumerate(keys_per_sample):
+        for kind, f, t in keys:
+            kinds.append(kind)
+            from_idx.append(f)
+            to_idx.append(t)
+            sample_idx.append(i)
+
+    if not kinds:
+        empty = torch.empty(0, device=device)
+        return empty, torch.empty(0, dtype=torch.long, device=device)
+
+    kinds_t = torch.tensor(kinds, dtype=torch.long, device=device)
+    from_idx_t = torch.tensor(from_idx, dtype=torch.long, device=device)
+    to_idx_t = torch.tensor(to_idx, dtype=torch.long, device=device)
+    sample_idx_t = torch.tensor(sample_idx, dtype=torch.long, device=device)
+
+    embed_dim = output.from_map.shape[1]
+    to_map_flat = output.to_map.reshape(
+        output.to_map.shape[0], embed_dim, -1
+    )  # (B, D, H*W)
+    from_map_flat = output.from_map.reshape(
+        output.from_map.shape[0], embed_dim, -1
+    )  # (B, D, H*W)
+
+    to_vecs = to_map_flat[sample_idx_t, :, to_idx_t]  # (N, D)
+
+    is_throw = kinds_t == MoveKind.THROW
+    is_place = kinds_t == MoveKind.PLACE
+    kind_slot = torch.where(is_throw, _THROW_KIND_SLOT, _MOVE_KIND_SLOT)
+    from_vecs = from_map_flat[sample_idx_t, :, from_idx_t] + output.kind_bias[kind_slot]
+
+    if is_place.any():
+        place_positions = is_place.nonzero(as_tuple=True)[0]
+        from_vecs = from_vecs.clone()
+        from_vecs[place_positions] = output.hand_embed[
+            sample_idx_t[place_positions], from_idx_t[place_positions]
+        ]
+
+    scores = (from_vecs * to_vecs).sum(dim=1)  # (N,)
+    return scores, sample_idx_t
+
+
+def segmented_log_softmax(
+    scores: torch.Tensor, sample_idx: torch.Tensor, num_samples: int
+) -> torch.Tensor:
+    """log_softmax of `scores`, computed independently *within* each group
+    named by `sample_idx` (0..num_samples-1) rather than over the whole
+    flat tensor -- each sample's legal actions must only compete against
+    that same sample's other legal actions, never another sample's.
+    Numerically stable the standard way (subtract each group's own max
+    before exponentiating).
+    """
+    seg_max = torch.full(
+        (num_samples,), float("-inf"), device=scores.device, dtype=scores.dtype
+    )
+    seg_max = seg_max.scatter_reduce(
+        0, sample_idx, scores, reduce="amax", include_self=True
+    )
+    shifted = scores - seg_max[sample_idx]
+    exp_scores = shifted.exp()
+    seg_sum = torch.zeros(num_samples, device=scores.device, dtype=scores.dtype)
+    seg_sum = seg_sum.scatter_add(0, sample_idx, exp_scores)
+    return shifted - seg_sum.log()[sample_idx]
